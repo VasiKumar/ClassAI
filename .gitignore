@@ -48,6 +48,9 @@ Thumbs.db
 desktop.ini
 
 # Camera test videos
+# Environment / secrets
+.env
+class_notes_*.json
 *.mp4
 *.avi
 *.mov

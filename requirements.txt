@@ -27,6 +27,10 @@ openai-whisper>=20231117
 sounddevice>=0.4.6
 soundfile>=0.12.1
 
+# AI Notes Generation (Gemini)
+google-genai>=1.0.0
+python-dotenv>=1.0.0
+
 # Optional: For deep learning-based detection
 # tensorflow>=2.13.0
 # keras>=2.13.1
