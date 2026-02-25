@@ -69,6 +69,10 @@ if 'monitoring_active' not in st.session_state:
     st.session_state.monitoring_active = False
 if 'monitoring_process' not in st.session_state:
     st.session_state.monitoring_process = None
+if 'audio_process' not in st.session_state:
+    st.session_state.audio_process = None
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = None
 if 'monitoring_start_time' not in st.session_state:
     st.session_state.monitoring_start_time = None
 if 'focus_threshold' not in st.session_state:
@@ -156,7 +160,7 @@ st.sidebar.markdown("---")
 
 page = st.sidebar.radio(
     "Go to",
-    ["🏠 Home", "👥 Students", "▶️ Start Monitoring", "📈 View Reports", "⚙️ Settings"]
+    ["🏠 Home", "👥 Students", "▶️ Start Monitoring", "📈 View Reports", "📝 Notes", "⚙️ Settings"]
 )
 
 # Main content based on selected page
@@ -472,11 +476,25 @@ elif page == "▶️ Start Monitoring":
                     try:
                         import sys
                         python_executable = sys.executable
+                        session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        st.session_state.session_id = session_id
                         process = subprocess.Popen(
                             [python_executable, 'student_monitor.py'],
                             cwd=os.getcwd(),
                             creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0
                         )
+                        
+                        # Start audio recorder alongside the monitoring session
+                        try:
+                            audio_process = subprocess.Popen(
+                                [python_executable, 'audio_recorder.py', '--session-id', session_id],
+                                cwd=os.getcwd(),
+                                creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0
+                            )
+                            st.session_state.audio_process = audio_process
+                        except Exception as ae:
+                            st.warning(f"⚠️ Audio recorder could not start: {ae}")
+                            st.session_state.audio_process = None
                         
                         st.session_state.monitoring_process = process
                         st.session_state.monitoring_active = True
@@ -487,15 +505,18 @@ elif page == "▶️ Start Monitoring":
                         time.sleep(2)  # Give process time to start
                         
                         st.success("✅ Monitoring session started successfully!")
+                        audio_status = "🎙️ Audio recording active" if st.session_state.audio_process else "⚠️ Audio recorder not started"
                         st.info(f"""
                         **Session Details:**
                         - Duration: {duration_minutes} minutes ({duration_seconds} seconds)
                         - Threshold: {threshold}%
                         - Students: {len(students)}
+                        - Session ID: `{session_id}`
                         
                         **A new window has opened for monitoring.**
                         - The camera will track student focus automatically
                         - Report will be generated when session ends
+                        - {audio_status} — view transcript in **📝 Notes**
                         - You can end the session early using the button below
                         """)
                         
@@ -566,8 +587,21 @@ elif page == "▶️ Start Monitoring":
                     # Small delay to ensure report file is written
                     time.sleep(3)
                     
+                    # Also stop audio recorder if still running
+                    if st.session_state.audio_process:
+                        try:
+                            if st.session_state.audio_process.poll() is None:
+                                st.session_state.audio_process.terminate()
+                                st.session_state.audio_process.wait(timeout=15)
+                        except Exception:
+                            try:
+                                st.session_state.audio_process.kill()
+                            except Exception:
+                                pass
+                    
                     st.session_state.monitoring_active = False
                     st.session_state.monitoring_process = None
+                    st.session_state.audio_process = None
                     st.session_state.monitoring_start_time = None
                     
                     st.success("✅ Session ended!")
@@ -865,13 +899,128 @@ elif page == "📈 View Reports":
     
     if absent_students:
         st.markdown("---")
-        st.subheader("�� Absent Students")
+        st.subheader("🚫 Absent Students")
         
         absent_cols = st.columns(min(5, len(absent_students)))
         for i, student in enumerate(sorted(absent_students)):
             with absent_cols[i % len(absent_cols)]:
                 st.error(f"❌ {student}")
 
+# ─────────────────────────────────────────────────────────────────────────────
+elif page == "📝 Notes":
+    st.markdown('<div class="main-header">📝 Class Notes</div>', unsafe_allow_html=True)
+    st.caption("Audio transcriptions captured by Whisper base model during live sessions.")
+
+    # ── Collect all notes files ───────────────────────────────────────────────
+    notes_files = sorted(
+        [f for f in os.listdir(".") if f.startswith("class_notes_") and f.endswith(".json")],
+        reverse=True,
+    )
+
+    if not notes_files:
+        st.warning("📭 No class notes found yet.")
+        st.info(
+            "Notes are recorded automatically when you start a monitoring session.\n\n"
+            "Make sure your microphone is accessible and start a new session from "
+            "**▶️ Start Monitoring**."
+        )
+        # Show live recording indicator if session is active
+        if st.session_state.monitoring_active and st.session_state.session_id:
+            live_file = f"class_notes_{st.session_state.session_id}.json"
+            st.success(f"🔴 **Recording in progress** — notes will appear here as `{live_file}` once the session ends.")
+            if st.button("🔄 Refresh"):
+                st.rerun()
+    else:
+        # ── Session selector ─────────────────────────────────────────────────
+        col_sel, col_ref = st.columns([5, 1])
+        with col_ref:
+            if st.button("🔄 Refresh", use_container_width=True):
+                st.rerun()
+
+        # Build display labels from filename timestamps
+        notes_options = {}
+        for nf in notes_files:
+            try:
+                session_ts = nf.replace("class_notes_", "").replace(".json", "")
+                dt = datetime.strptime(session_ts, "%Y%m%d_%H%M%S")
+                label = dt.strftime("%B %d, %Y at %I:%M %p")
+            except Exception:
+                label = nf
+            notes_options[f"{label}  ({nf})"] = nf
+
+        with col_sel:
+            selected_label = st.selectbox("Select session:", list(notes_options.keys()))
+
+        selected_notes_file = notes_options[selected_label]
+
+        # Show live badge if this is the active session
+        if (
+            st.session_state.monitoring_active
+            and st.session_state.session_id
+            and selected_notes_file == f"class_notes_{st.session_state.session_id}.json"
+        ):
+            st.success("🔴 **Live — recording in progress.** Refresh to see new segments.")
+
+        # ── Load notes data ───────────────────────────────────────────────────
+        try:
+            with open(selected_notes_file, "r", encoding="utf-8") as f:
+                notes_data = json.load(f)
+        except Exception as e:
+            st.error(f"❌ Could not load {selected_notes_file}: {e}")
+            st.stop()
+
+        full_transcript = notes_data.get("full_transcript", "").strip()
+        segments        = notes_data.get("segments", [])
+        saved_at        = notes_data.get("timestamp", "")
+
+        if saved_at:
+            try:
+                dt_saved = datetime.fromisoformat(saved_at)
+                st.caption(f"Last updated: {dt_saved.strftime('%B %d, %Y at %I:%M:%S %p')}")
+            except Exception:
+                pass
+
+        # ── Metrics row ───────────────────────────────────────────────────────
+        word_count = len(full_transcript.split()) if full_transcript else 0
+        col_m1, col_m2, col_m3 = st.columns(3)
+        col_m1.metric("🎙️ Segments", len(segments))
+        col_m2.metric("📝 Total Words", word_count)
+        col_m3.metric("⏱️ Duration covered", f"{len(segments) * 30}s" if segments else "—")
+
+        st.markdown("---")
+
+        # ── Tabs ──────────────────────────────────────────────────────────────
+        tab_raw, tab_segments = st.tabs(["📄 Raw", "🕐 By Segment"])
+
+        with tab_raw:
+            st.subheader("Raw Transcript")
+            if full_transcript:
+                st.text_area(
+                    label="All spoken text (full session)",
+                    value=full_transcript,
+                    height=500,
+                    key="raw_transcript_area",
+                )
+                # Download button
+                st.download_button(
+                    label="⬇️ Download transcript (.txt)",
+                    data=full_transcript,
+                    file_name=selected_notes_file.replace(".json", ".txt"),
+                    mime="text/plain",
+                )
+            else:
+                st.info("No speech detected yet in this session.")
+
+        with tab_segments:
+            st.subheader("Transcript by Segment")
+            if segments:
+                for seg in segments:
+                    with st.expander(f"🕐 {seg.get('time', '?')}"):
+                        st.write(seg.get("text", ""))
+            else:
+                st.info("No segments recorded yet.")
+
+# ─────────────────────────────────────────────────────────────────────────────
 elif page == "⚙️ Settings":
     st.markdown('<div class="main-header">⚙️ Settings</div>', unsafe_allow_html=True)
     

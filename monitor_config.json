@@ -1,5 +1,5 @@
 {
-    "duration": 60,
+    "duration": 300,
     "threshold": 50,
-    "enable_mobile_detection": true
+    "enable_mobile_detection": false
 }

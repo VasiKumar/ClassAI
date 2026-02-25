@@ -22,6 +22,11 @@ ultralytics>=8.0.0
 torch>=2.0.0
 torchvision>=0.15.0
 
+# Audio Recording & Transcription
+openai-whisper>=20231117
+sounddevice>=0.4.6
+soundfile>=0.12.1
+
 # Optional: For deep learning-based detection
 # tensorflow>=2.13.0
 # keras>=2.13.1
