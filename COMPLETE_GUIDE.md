@@ -1,4 +1,4 @@
-# 🎓 Student Focus Monitoring System - Complete Setup
+# 🎓 Sahayak AI - Complete Setup
 
 ## 📋 System Components
 

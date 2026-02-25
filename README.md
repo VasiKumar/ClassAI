@@ -1,4 +1,4 @@
-# 🎓 AI Student Focus Monitoring System
+# 🎓 AI Sahayak AI
 
 An intelligent system that monitors student attention and engagement during online classes or exams using real-time face detection, gaze tracking, and mobile phone detection.
 

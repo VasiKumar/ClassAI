@@ -362,7 +362,7 @@ Focus Threshold: 50%
 
 ## 📝 Version Information
 
-- **Project**: AI Student Focus Monitoring System
+- **Project**: AI Sahayak AI
 - **Created**: February 25, 2026
 - **Platform**: Windows compatible
 - **Python**: 3.8+ required

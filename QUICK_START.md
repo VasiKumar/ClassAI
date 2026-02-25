@@ -1,4 +1,4 @@
-# 🚀 Quick Start - Student Focus Monitoring System
+# 🚀 Quick Start - Sahayak AI
 
 ## ⚡ Fast Setup (5 Minutes)
 

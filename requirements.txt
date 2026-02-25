@@ -1,4 +1,4 @@
-# Student Focus Monitoring System - Requirements
+# Sahayak AI - Requirements
 
 # Computer Vision
 opencv-python>=4.8.0

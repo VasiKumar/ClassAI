@@ -1,5 +1,5 @@
 """
-Student Focus Monitoring System - Streamlit Dashboard
+Sahayak AI - Streamlit Dashboard
 Admin interface for monitoring students and viewing reports
 """
 
@@ -243,7 +243,7 @@ page = st.sidebar.radio(
 
 # Main content based on selected page
 if page == "🏠 Home":
-    st.markdown('<div class="main-header">🎓 Student Focus Monitoring System</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-header">🎓 Sahayak AI</div>', unsafe_allow_html=True)
     
     # Check if monitoring process is still running
     if st.session_state.monitoring_active and st.session_state.monitoring_process:
@@ -1247,7 +1247,7 @@ elif page == "⚙️ Settings":
     st.subheader("ℹ️ About")
     
     st.info("""
-    **Student Focus Monitoring System**
+    **Sahayak AI**
     
     Version: 1.0.0
     
@@ -1265,6 +1265,6 @@ elif page == "⚙️ Settings":
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: gray;'>
-    <p>🎓 Student Focus Monitoring System | Made with ❤️ using Streamlit</p>
+    <p>🎓 Sahayak AI | Made with ❤️ using Streamlit</p>
 </div>
 """, unsafe_allow_html=True)

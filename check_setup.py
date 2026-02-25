@@ -9,7 +9,7 @@ def check_system():
     """Check if the system is ready to run"""
     
     print("\n" + "="*70)
-    print("STUDENT FOCUS MONITORING SYSTEM - SETUP CHECK")
+    print("Sahayak AI - SETUP CHECK")
     print("="*70 + "\n")
     
     all_good = True

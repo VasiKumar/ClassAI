@@ -1,4 +1,4 @@
-# Student Focus Monitoring System - Streamlit Dashboard
+# Sahayak AI - Streamlit Dashboard
 
 ## 🎓 Overview
 

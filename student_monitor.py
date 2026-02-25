@@ -1,5 +1,5 @@
 """
-AI-Based Student Focus Monitoring System with ML Face Recognition
+AI-Based Sahayak AI with ML Face Recognition
 Detects faces, monitors focus, and identifies mobile phone usage
 Uses face_recognition library for accurate ML-based face detection
 """
@@ -850,11 +850,11 @@ def main():
     import json
     
     print("\n" + "="*70)
-    print("STUDENT FOCUS MONITORING SYSTEM")
+    print("Sahayak AI")
     print("="*70)
     
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Student Focus Monitoring System')
+    parser = argparse.ArgumentParser(description='Sahayak AI')
     parser.add_argument('--duration', type=int, help='Monitoring duration in seconds')
     parser.add_argument('--threshold', type=int, help='Focus threshold percentage')
     parser.add_argument('--enable-mobile-detection', action='store_true', help='Enable mobile phone detection')
