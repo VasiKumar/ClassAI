@@ -1,0 +1,27 @@
+# Student Focus Monitoring System - Requirements
+
+# Computer Vision
+opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0
+
+# Image Processing
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# ML-based Face Recognition (RECOMMENDED for better accuracy)
+face-recognition>=1.3.0
+dlib>=19.24.0
+
+# Web Dashboard
+streamlit>=1.30.0
+plotly>=5.18.0
+pandas>=2.0.0
+
+# YOLOv8 Mobile Detection (official Ultralytics)
+ultralytics>=8.0.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Optional: For deep learning-based detection
+# tensorflow>=2.13.0
+# keras>=2.13.1
