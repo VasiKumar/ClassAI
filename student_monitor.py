@@ -9,6 +9,8 @@ import numpy as np
 import os
 import zipfile
 import time
+import queue
+import threading
 from datetime import datetime
 from pathlib import Path
 import json
@@ -17,6 +19,22 @@ import sys
 import warnings
 import signal
 import atexit
+
+# ── Whisper speech-to-text ──────────────────────────────────────────────────
+WHISPER_AVAILABLE = False
+_whisper_lib = None
+try:
+    import whisper as _whisper_lib
+    WHISPER_AVAILABLE = True
+except ImportError:
+    pass
+
+_AUDIO_AVAILABLE = False
+try:
+    import sounddevice as _sd
+    _AUDIO_AVAILABLE = True
+except ImportError:
+    pass
 
 # Suppress all warnings during face_recognition import
 warnings.filterwarnings('ignore')
@@ -56,6 +74,36 @@ except:
     print("  This is OK - the system will still work!")
     print("  OpenCV mode uses histogram matching for face recognition.")
 
+# ── GPU face recognition via facenet-pytorch (primary) ─────────────────────
+CUDA_AVAILABLE = False
+FACE_RECOGNITION_MODEL = "hog"
+FACENET_AVAILABLE = False
+FACENET_DEVICE = None
+
+try:
+    import torch
+    from facenet_pytorch import MTCNN, InceptionResnetV1
+    FACENET_DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    CUDA_AVAILABLE = (FACENET_DEVICE.type == 'cuda')
+    FACENET_AVAILABLE = True
+    if CUDA_AVAILABLE:
+        print(f"✓ GPU detected: {torch.cuda.get_device_name(0)} — face training & recognition on GPU")
+        FACE_RECOGNITION_MODEL = "cnn"
+    else:
+        print("  facenet-pytorch loaded (CPU) — no CUDA GPU found")
+except Exception as _fe:
+    FACENET_AVAILABLE = False
+    FACENET_DEVICE = None
+    # Fallback: try dlib CUDA
+    try:
+        import dlib
+        CUDA_AVAILABLE = dlib.DLIB_USE_CUDA
+        FACE_RECOGNITION_MODEL = "cnn" if CUDA_AVAILABLE else "hog"
+        if CUDA_AVAILABLE:
+            print("✓ GPU (dlib CUDA) — using CNN face model")
+    except Exception:
+        pass
+
 class StudentMonitor:
     def __init__(self, student_photos_path=".", check_interval=60, focus_threshold=50, enable_mobile_detection=False):
         """
@@ -73,8 +121,11 @@ class StudentMonitor:
         self.student_data = {}
         self.known_faces = {}
         self.known_face_encodings = {}
+        self.facenet_embeddings = {}   # GPU embeddings keyed by student name
         self.face_cascade = None
         self.eye_cascade = None
+        self.mtcnn = None              # facenet-pytorch face detector
+        self.resnet = None             # facenet-pytorch encoder (GPU)
         self.start_time = None
         self.should_stop = False
         self._report_generated = False
@@ -82,6 +133,11 @@ class StudentMonitor:
         self.mobile_detection_boxes = []
         self.stop_file = "monitor_stop.signal"
         self.yolo_model = None
+        # Whisper / audio transcription
+        self.whisper_model = None
+        self._audio_stop_event = None
+        self._audio_thread = None
+        self._whisper_session_id = None
         
         # Clean up old stop file
         if os.path.exists(self.stop_file):
@@ -93,6 +149,7 @@ class StudentMonitor:
         # Initialize detection models
         self._load_cascades()
         self._load_yolov8()
+        self._load_facenet()  # GPU face recognition model
         
         # Load and train on student photos from zip files
         print("\n" + "="*70)
@@ -100,6 +157,141 @@ class StudentMonitor:
         print("="*70)
         self._load_student_photos()
     
+    # ── Whisper helpers ────────────────────────────────────────────────────
+    def _load_whisper(self):
+        """Load Whisper base model on GPU right when the camera opens."""
+        if not WHISPER_AVAILABLE:
+            print("⚠ Whisper not available — pip install openai-whisper sounddevice")
+            return
+        if not _AUDIO_AVAILABLE:
+            print("⚠ sounddevice not available — pip install sounddevice")
+            return
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            gpu_label = f"GPU ({torch.cuda.get_device_name(0)})" if device == "cuda" else "CPU"
+            print(f"⏳ Loading Whisper base model on {gpu_label}...")
+            self.whisper_model = _whisper_lib.load_model("base", device=device)
+            print(f"✓ Whisper base model loaded on {gpu_label}")
+        except Exception as e:
+            print(f"⚠ Whisper load failed: {e}")
+            self.whisper_model = None
+
+    def _run_audio_transcription(self, session_id: str):
+        """
+        Background thread: records audio in 30-second chunks and
+        transcribes each chunk with Whisper, saving results to
+        class_notes_<session_id>.json
+        """
+        SAMPLE_RATE = 16000
+        CHUNK_SECONDS = 30
+        notes_file = f"class_notes_{session_id}.json"
+        segments = []
+        full_parts = []
+        session_start = time.time()
+        audio_q = queue.Queue()
+        stop_ev = self._audio_stop_event
+
+        def _recording_loop():
+            chunk_samples = int(CHUNK_SECONDS * SAMPLE_RATE)
+            while not stop_ev.is_set():
+                try:
+                    chunk = _sd.rec(chunk_samples, samplerate=SAMPLE_RATE,
+                                    channels=1, dtype="float32")
+                    for _ in range(CHUNK_SECONDS):
+                        if stop_ev.is_set():
+                            _sd.stop()
+                            break
+                        time.sleep(1)
+                    else:
+                        _sd.wait()
+                    audio_q.put(chunk.copy())
+                except Exception as rec_err:
+                    print(f"  [Audio] Recording error: {rec_err}")
+                    time.sleep(1)
+
+        rec_thread = threading.Thread(target=_recording_loop, daemon=True)
+        rec_thread.start()
+        print("🎤 Audio transcription started (Whisper base)")
+
+        try:
+            while not stop_ev.is_set():
+                try:
+                    audio_chunk = audio_q.get(timeout=2)
+                except queue.Empty:
+                    continue
+                elapsed = time.time() - session_start
+                t_label = f"{int(elapsed)//60}:{int(elapsed)%60:02d}"
+                try:
+                    af = audio_chunk.astype(np.float32)
+                    if af.ndim > 1:
+                        af = af.mean(axis=1)
+                    mx = np.abs(af).max()
+                    if mx > 0:
+                        af = af / mx
+                    result = self.whisper_model.transcribe(af, language="en", fp16=False)
+                    text = result.get("text", "").strip()
+                except Exception as tr_err:
+                    print(f"  [Whisper] Transcription error: {tr_err}")
+                    text = ""
+                if text:
+                    segments.append({"time": t_label, "text": text})
+                    full_parts.append(text)
+                    print(f"  📝 [{t_label}] {text[:80]}{'...' if len(text)>80 else ''}")
+                # Drain any remaining in queue after stop
+                while not audio_q.empty():
+                    try:
+                        extra = audio_q.get_nowait()
+                        af = extra.astype(np.float32)
+                        if af.ndim > 1:
+                            af = af.mean(axis=1)
+                        mx = np.abs(af).max()
+                        if mx > 0:
+                            af = af / mx
+                        res2 = self.whisper_model.transcribe(af, language="en", fp16=False)
+                        t2 = res2.get("text", "").strip()
+                        if t2:
+                            segments.append({"time": t_label, "text": t2})
+                            full_parts.append(t2)
+                    except Exception:
+                        break
+        finally:
+            stop_ev.set()
+            rec_thread.join(timeout=5)
+            data = {
+                "timestamp": datetime.now().isoformat(),
+                "segments": segments,
+                "full_transcript": " ".join(full_parts),
+            }
+            tmp = notes_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+            os.replace(tmp, notes_file)
+            print(f"✅ Transcript saved → {notes_file} ({len(segments)} segments)")
+
+    def _load_facenet(self):
+        """Load MTCNN + InceptionResnetV1 on GPU for fast, accurate face recognition"""
+        if not FACENET_AVAILABLE:
+            return
+        try:
+            from facenet_pytorch import MTCNN, InceptionResnetV1
+            # MTCNN: detects & aligns faces to 160×160 before encoding
+            self.mtcnn = MTCNN(
+                image_size=160,
+                margin=20,
+                keep_all=True,       # return all faces in frame
+                device=FACENET_DEVICE,
+                post_process=True,   # normalize to [-1, 1]
+            )
+            # InceptionResnetV1 pretrained on VGGFace2 (very good for ID)
+            self.resnet = InceptionResnetV1(pretrained='vggface2').eval().to(FACENET_DEVICE)
+            device_label = f"GPU ({FACENET_DEVICE})" if CUDA_AVAILABLE else "CPU"
+            print(f"✓ facenet-pytorch loaded on {device_label}")
+        except Exception as e:
+            print(f"⚠ Could not load facenet-pytorch: {e}")
+            self.mtcnn = None
+            self.resnet = None
+
     def _load_cascades(self):
         """Load OpenCV cascade classifiers"""
         try:
@@ -120,16 +312,24 @@ class StudentMonitor:
     def _load_yolov8(self):
         """Load YOLOv8l model for mobile phone detection"""
         try:
+            import torch
             from ultralytics import YOLO
             model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yolov8l.pt')
             if not os.path.exists(model_path):
                 model_path = 'yolov8l.pt'  # Try relative path
             self.yolo_model = YOLO(model_path)
-            print("\u2713 YOLOv8l loaded for mobile phone detection")
+            # Force YOLO onto GPU if available
+            self._yolo_device = 0 if torch.cuda.is_available() else 'cpu'
+            if torch.cuda.is_available():
+                self.yolo_model.to('cuda')
+                print(f"\u2713 YOLOv8l loaded on GPU ({torch.cuda.get_device_name(0)}) for mobile phone detection")
+            else:
+                print("\u2713 YOLOv8l loaded for mobile phone detection (CPU)")
         except Exception as e:
             print(f"\u26a0 Could not load YOLOv8l: {e}")
             print("  Mobile detection will use basic edge detection as fallback")
             self.yolo_model = None
+            self._yolo_device = 'cpu'
     
     def _extract_nested_zips(self, extract_path):
         """Recursively extract nested zip files (e.g., basistha.zip, sarbeswar.zip)"""
@@ -226,13 +426,23 @@ class StudentMonitor:
                         if success:
                             students_trained += 1
             
-            total_students = len(self.known_face_encodings) if FACE_RECOGNITION_AVAILABLE else len(self.known_faces)
+            if FACENET_AVAILABLE and self.facenet_embeddings:
+                import torch
+                total_students = len(self.facenet_embeddings)
+                gpu_name = torch.cuda.get_device_name(0) if CUDA_AVAILABLE else "CPU"
+                method = f"facenet-pytorch {'GPU (' + gpu_name + ')' if CUDA_AVAILABLE else 'CPU'} — 512-d embeddings"
+            elif FACE_RECOGNITION_AVAILABLE and self.known_face_encodings:
+                total_students = len(self.known_face_encodings)
+                method = "face_recognition (dlib, CPU) — 128-d embeddings"
+            else:
+                total_students = len(self.known_faces)
+                method = "OpenCV histogram (CPU fallback)"
             print(f"\n{'='*70}")
             print(f"✅ MODEL TRAINED SUCCESSFULLY")
             print(f"{'='*70}")
             print(f"📊 Total students registered: {total_students}")
             print(f"📸 Total photos processed: {students_trained}")
-            print(f"🤖 Recognition method: {'ML-based (face_recognition)' if FACE_RECOGNITION_AVAILABLE else 'OpenCV histogram'}")
+            print(f"🤖 Recognition method: {method}")
             print(f"{'='*70}\n")
         
         except Exception as e:
@@ -250,18 +460,46 @@ class StudentMonitor:
             Boolean indicating success
         """
         try:
+            # ── Path 1: facenet-pytorch on GPU (fastest & most accurate) ──────
+            if FACENET_AVAILABLE and self.mtcnn is not None and self.resnet is not None:
+                try:
+                    import torch
+                    from PIL import Image as PILImage
+                    img_pil = PILImage.open(img_path).convert('RGB')
+                    # MTCNN detects, aligns, and crops face to 160×160
+                    face_tensor = self.mtcnn(img_pil)   # shape: (N, 3, 160, 160) or None
+                    if face_tensor is not None:
+                        # Take first face only (training images should have one face)
+                        if face_tensor.dim() == 4:
+                            face_tensor = face_tensor[0].unsqueeze(0)
+                        face_tensor = face_tensor.to(FACENET_DEVICE)
+                        with torch.no_grad():
+                            embedding = self.resnet(face_tensor).cpu().numpy()[0]  # 512-d
+                        if student_name not in self.facenet_embeddings:
+                            self.facenet_embeddings[student_name] = []
+                            self._initialize_student_data(student_name)
+                        self.facenet_embeddings[student_name].append(embedding)
+                        print(f"  ✓ [GPU] Trained on: {student_name} ({os.path.basename(img_path)})")
+                        return True
+                    else:
+                        print(f"  ⚠ No face detected in: {os.path.basename(img_path)}")
+                        return False
+                except Exception as fe_err:
+                    print(f"  ⚠ facenet GPU training failed, falling back: {fe_err}")
+                    # fall through to face_recognition below
+
+            # ── Path 2: face_recognition (dlib, CPU) ─────────────────────────
             if FACE_RECOGNITION_AVAILABLE:
-                # Use ML-based face recognition
                 try:
                     image = face_recognition.load_image_file(img_path)
-                    face_encodings = face_recognition.face_encodings(image)
-                    
+                    face_locations = face_recognition.face_locations(image, model=FACE_RECOGNITION_MODEL)
+                    face_encodings = face_recognition.face_encodings(
+                        image, known_face_locations=face_locations, num_jitters=10
+                    )
                     if len(face_encodings) > 0:
-                        # Store the first face encoding found
                         if student_name not in self.known_face_encodings:
                             self.known_face_encodings[student_name] = []
                             self._initialize_student_data(student_name)
-                        
                         self.known_face_encodings[student_name].append(face_encodings[0])
                         print(f"  ✓ Trained on: {student_name} ({os.path.basename(img_path)})")
                         return True
@@ -269,10 +507,7 @@ class StudentMonitor:
                         print(f"  ⚠ No face detected in: {os.path.basename(img_path)}")
                         return False
                 except Exception as fr_error:
-                    # If face_recognition fails, fall back to OpenCV
                     print(f"  ⚠ ML method failed, using OpenCV for: {os.path.basename(img_path)}")
-                    if "face_recognition_models" in str(fr_error):
-                        print("  Note: face_recognition_models issue detected, using OpenCV mode for this session")
                     # Fall through to OpenCV method below
             
             # OpenCV fallback method
@@ -347,7 +582,8 @@ class StudentMonitor:
         """Detect mobile phone using YOLOv8l (COCO class 67: cell phone)"""
         try:
             self.mobile_detection_boxes = []
-            results = self.yolo_model(frame, verbose=False, conf=0.25)
+            device = getattr(self, '_yolo_device', 0)
+            results = self.yolo_model(frame, verbose=False, conf=0.25, device=device)
             detected = False
             for result in results:
                 for box in result.boxes:
@@ -399,45 +635,67 @@ class StudentMonitor:
         # Only return True if multiple candidates detected (reduces single-object false positives)
         return phone_candidates >= 2
     
+    def _facenet_embed(self, face_bgr_img):
+        """Get 512-d facenet embedding for a BGR face crop. Returns None on failure."""
+        try:
+            import torch
+            from PIL import Image as PILImage
+            face_rgb = cv2.cvtColor(face_bgr_img, cv2.COLOR_BGR2RGB)
+            img_pil = PILImage.fromarray(face_rgb)
+            face_tensor = self.mtcnn(img_pil)
+            if face_tensor is None:
+                return None
+            if face_tensor.dim() == 4:
+                face_tensor = face_tensor[0].unsqueeze(0)
+            face_tensor = face_tensor.to(FACENET_DEVICE)
+            with torch.no_grad():
+                embedding = self.resnet(face_tensor).cpu().numpy()[0]
+            return embedding
+        except Exception:
+            return None
+
     def match_face(self, face_img, face_location=None):
         """
         Match detected face with known student faces using ML
-        
-        Args:
-            face_img: Detected face image (for OpenCV method)
-            face_location: Face location tuple (for face_recognition method)
-        
-        Returns:
-            Student name if matched, else "Unknown"
+
+        Priority: facenet-pytorch GPU → face_recognition CPU → OpenCV histogram
         """
-        if FACE_RECOGNITION_AVAILABLE and face_location is not None:
-            # Use ML-based face recognition (more accurate)
+        # ── Path 1: facenet-pytorch GPU matching ─────────────────────────────
+        if FACENET_AVAILABLE and self.mtcnn is not None and self.resnet is not None and self.facenet_embeddings:
             try:
-                # Get encoding for this face
+                import numpy as np
+                probe = self._facenet_embed(face_img)
+                if probe is not None:
+                    best_match = "Unknown"
+                    best_dist = 0.75  # L2 distance threshold (≤0.75 = same person; family ~0.85+)
+                    for student_name, embeddings in self.facenet_embeddings.items():
+                        for known_emb in embeddings:
+                            dist = float(np.linalg.norm(probe - known_emb))
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_match = student_name
+                    return best_match
+            except Exception as e:
+                pass  # fall through
+
+        # ── Path 2: face_recognition (dlib) ──────────────────────────────────
+        if FACE_RECOGNITION_AVAILABLE and face_location is not None and self.known_face_encodings:
+            try:
                 rgb_frame = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB) if len(face_img.shape) == 3 else face_img
                 face_encodings = face_recognition.face_encodings(rgb_frame, [face_location])
-                
                 if len(face_encodings) == 0:
                     return "Unknown"
-                
                 face_encoding = face_encodings[0]
-                
-                # Compare with all known students
                 best_match = "Unknown"
-                best_distance = 0.6  # Threshold for matching (lower is stricter)
-                
+                best_distance = 0.40
                 for student_name, known_encodings in self.known_face_encodings.items():
-                    # Compare with all training images of this student
                     distances = face_recognition.face_distance(known_encodings, face_encoding)
                     min_distance = min(distances) if len(distances) > 0 else 1.0
-                    
                     if min_distance < best_distance:
                         best_distance = min_distance
                         best_match = student_name
-                
                 return best_match
             except Exception as e:
-                print(f"  ⚠ Face matching error: {e}")
                 return "Unknown"
         else:
             # Fallback to OpenCV histogram method
@@ -496,10 +754,54 @@ class StudentMonitor:
                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         
         # STEP 2: Detect and track student faces
-        if FACE_RECOGNITION_AVAILABLE:
-            # ML-based face recognition
+        if FACENET_AVAILABLE and self.mtcnn is not None and self.resnet is not None:
+            # ── GPU path: MTCNN detects faces, InceptionResnetV1 encodes ─────
+            import torch
+            from PIL import Image as PILImage
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            face_locations = face_recognition.face_locations(rgb_frame)
+            img_pil = PILImage.fromarray(rgb_frame)
+            boxes, _ = self.mtcnn.detect(img_pil)  # detect without cropping
+            if boxes is None:
+                boxes = []
+            for box in boxes:
+                left, top, right, bottom = [max(0, int(v)) for v in box]
+                face_region = frame[top:bottom, left:right]
+                if face_region.size == 0:
+                    continue
+                student_name = self.match_face(face_region)
+                if student_name != "Unknown" and student_name in self.student_data:
+                    is_focused = self.detect_gaze(face_region)
+                    self.student_data[student_name]['total_checks'] += 1
+                    if is_focused:
+                        self.student_data[student_name]['focused_count'] += 1
+                        status_text = f"{student_name}: Focused"
+                        color = (0, 255, 0)
+                    else:
+                        self.student_data[student_name]['unfocused_count'] += 1
+                        status_text = f"{student_name}: Not Focused"
+                        color = (0, 165, 255)
+                    if mobile_detected_in_frame:
+                        self.student_data[student_name]['mobile_detected'] += 1
+                        current_time = datetime.now().strftime("%H:%M:%S")
+                        self.student_data[student_name]['mobile_times'].append(current_time)
+                    cv2.rectangle(frame, (left, top), (right, bottom), color, 3)
+                    text_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                    cv2.rectangle(frame, (left, top - text_size[1] - 10),
+                                (left + text_size[0], top), color, -1)
+                    cv2.putText(frame, status_text, (left, top - 5),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                else:
+                    cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
+                    status_text = "Unknown"
+                    text_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                    cv2.rectangle(frame, (left, top - text_size[1] - 10),
+                                (left + text_size[0], top), (0, 0, 255), -1)
+                    cv2.putText(frame, status_text, (left, top - 5),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        elif FACE_RECOGNITION_AVAILABLE:
+            # ── CPU fallback: dlib face_recognition ──────────────────────────
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            face_locations = face_recognition.face_locations(rgb_frame, model=FACE_RECOGNITION_MODEL)
             
             for face_location in face_locations:
                 top, right, bottom, left = face_location
@@ -538,6 +840,15 @@ class StudentMonitor:
                     cv2.rectangle(frame, (left, top - text_size[1] - 10), 
                                 (left + text_size[0], top), color, -1)
                     cv2.putText(frame, status_text, (left, top - 5), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                else:
+                    # Draw RED rectangle for unrecognized / unknown face
+                    cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
+                    status_text = "Unknown"
+                    text_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                    cv2.rectangle(frame, (left, top - text_size[1] - 10),
+                                (left + text_size[0], top), (0, 0, 255), -1)
+                    cv2.putText(frame, status_text, (left, top - 5),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         else:
             # OpenCV face detection (fallback)
@@ -578,6 +889,15 @@ class StudentMonitor:
                     cv2.rectangle(frame, (x, y - text_size[1] - 10), 
                                 (x + text_size[0], y), color, -1)
                     cv2.putText(frame, status_text, (x, y - 5), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                else:
+                    # Draw RED rectangle for unrecognized / unknown face
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 0, 255), 2)
+                    status_text = "Unknown"
+                    text_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                    cv2.rectangle(frame, (x, y - text_size[1] - 10),
+                                (x + text_size[0], y), (0, 0, 255), -1)
+                    cv2.putText(frame, status_text, (x, y - 5),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
         # STEP 3: Display timer
@@ -763,6 +1083,18 @@ class StudentMonitor:
         if not cap.isOpened():
             print("Error: Could not open camera")
             return
+
+        # ── Load Whisper now that camera is confirmed open ────────────────────
+        self._load_whisper()
+        if self.whisper_model is not None and _AUDIO_AVAILABLE:
+            self._whisper_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._audio_stop_event = threading.Event()
+            self._audio_thread = threading.Thread(
+                target=self._run_audio_transcription,
+                args=(self._whisper_session_id,),
+                daemon=True,
+            )
+            self._audio_thread.start()
         
         print("\n" + "="*70)
         print("STARTING STUDENT FOCUS MONITOR")
@@ -823,6 +1155,12 @@ class StudentMonitor:
         
         finally:
             print("\n🔄 Cleaning up and generating report...")
+            # Stop audio transcription thread
+            if self._audio_stop_event is not None:
+                self._audio_stop_event.set()
+            if self._audio_thread is not None and self._audio_thread.is_alive():
+                print("⏳ Waiting for Whisper to finish last chunk...")
+                self._audio_thread.join(timeout=15)
             # Cleanup
             cap.release()
             cv2.destroyAllWindows()
