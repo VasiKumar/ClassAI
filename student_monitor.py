@@ -1084,6 +1084,14 @@ class StudentMonitor:
             print("Error: Could not open camera")
             return
 
+        # ── Signal audio_recorder.py that the camera is ready ─────────────────
+        try:
+            with open('camera_ready.signal', 'w') as _sig:
+                _sig.write('ready')
+            print("✓ Camera ready signal written for audio recorder")
+        except Exception as _sig_err:
+            print(f"⚠ Could not write camera_ready.signal: {_sig_err}")
+
         # ── Load Whisper now that camera is confirmed open ────────────────────
         self._load_whisper()
         if self.whisper_model is not None and _AUDIO_AVAILABLE:

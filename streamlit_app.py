@@ -24,6 +24,9 @@ try:
 except ImportError:
     pass  # python-dotenv not installed; env vars must be set manually
 
+import re
+import io
+
 # ── Gemini helper ─────────────────────────────────────────────────────────────
 def _gemini_available():
     try:
@@ -32,6 +35,34 @@ def _gemini_available():
         return bool(key and key != "your_gemini_api_key_here")
     except ImportError:
         return False
+
+
+# ── Text-to-Speech helper ──────────────────────────────────────────────────────
+def _markdown_to_plain(md: str) -> str:
+    """Strip Markdown syntax so TTS reads clean prose."""
+    text = re.sub(r"#{1,6}\s*", "", md)          # headings
+    text = re.sub(r"\*{1,3}(.+?)\*{1,3}", r"\1", text)  # bold / italic
+    text = re.sub(r"_{1,3}(.+?)_{1,3}", r"\1", text)    # underscore emphasis
+    text = re.sub(r"`{1,3}[^`]*`{1,3}", "", text)       # inline code / code blocks
+    text = re.sub(r"!?\[([^\]]*?)\]\([^)]*\)", r"\1", text)  # links / images
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)  # bullets
+    text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)  # numbered lists
+    text = re.sub(r"^\s*>+\s*", "", text, flags=re.MULTILINE)     # blockquotes
+    text = re.sub(r"---+|===+", "", text)         # horizontal rules
+    text = re.sub(r"\n{3,}", "\n\n", text)        # excess blank lines
+    return text.strip()
+
+
+def _tts_audio_bytes(text: str) -> bytes:
+    """Convert plain text to MP3 bytes using gTTS."""
+    try:
+        from gtts import gTTS
+        buf = io.BytesIO()
+        gTTS(text=text, lang="en", slow=False).write_to_fp(buf)
+        buf.seek(0)
+        return buf.read()
+    except Exception as e:
+        return b""
 
 
 def generate_star_notes(raw_transcript: str) -> dict:
@@ -106,38 +137,224 @@ st.set_page_config(
 # Custom CSS
 st.markdown("""
 <style>
+    /* ── Google Font ─────────────────────────────────────────── */
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
+
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+        font-size: 16px;
+    }
+
+    /* ── Page background ─────────────────────────────────────── */
+    .stApp {
+        background: linear-gradient(135deg, #f0f4ff 0%, #faf0ff 50%, #f0fff4 100%);
+    }
+
+    /* ── Main hero header ────────────────────────────────────── */
     .main-header {
-        font-size: 2.5rem;
-        font-weight: bold;
-        color: #1f77b4;
+        font-size: 3rem;
+        font-weight: 800;
         text-align: center;
-        margin-bottom: 2rem;
+        margin-bottom: 1.8rem;
+        letter-spacing: -0.5px;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 40%, #f093fb 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+        text-shadow: none;
+        padding: 0.4rem 0;
     }
+
+    /* ── Section subheaders ──────────────────────────────────── */
+    h2, h3 {
+        font-size: 1.45rem !important;
+        font-weight: 700 !important;
+        color: #3d3d6e !important;
+        letter-spacing: -0.2px;
+    }
+
+    /* ── Generic card ────────────────────────────────────────── */
     .metric-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin: 0.5rem 0;
+        background: linear-gradient(135deg, #ffffff 0%, #f3f4ff 100%);
+        border: 1px solid #dde1ff;
+        padding: 1.2rem 1.4rem;
+        border-radius: 14px;
+        margin: 0.6rem 0;
+        box-shadow: 0 3px 12px rgba(102, 126, 234, 0.10);
+        font-size: 1.05rem;
+        transition: transform 0.15s ease, box-shadow 0.15s ease;
     }
+    .metric-card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 20px rgba(102, 126, 234, 0.18);
+    }
+    .metric-card h3 {
+        color: #4a4aaa !important;
+        font-size: 1.1rem !important;
+        margin-bottom: 0.3rem;
+    }
+    .metric-card p {
+        color: #555577;
+        font-size: 0.95rem;
+        margin: 0;
+    }
+
+    /* ── Student present / absent pills ─────────────────────── */
     .student-present {
-        background-color: #d4edda;
-        padding: 0.5rem;
-        border-radius: 0.3rem;
-        margin: 0.2rem 0;
+        background: linear-gradient(135deg, #d4edda, #a8f0be);
+        border-left: 4px solid #28a745;
+        padding: 0.6rem 1rem;
+        border-radius: 8px;
+        margin: 0.3rem 0;
+        font-size: 1rem;
+        color: #155724;
+        font-weight: 600;
     }
     .student-absent {
-        background-color: #f8d7da;
-        padding: 0.5rem;
-        border-radius: 0.3rem;
-        margin: 0.2rem 0;
+        background: linear-gradient(135deg, #f8d7da, #ffc0cb);
+        border-left: 4px solid #dc3545;
+        padding: 0.6rem 1rem;
+        border-radius: 8px;
+        margin: 0.3rem 0;
+        font-size: 1rem;
+        color: #721c24;
+        font-weight: 600;
     }
+
+    /* ── Focus labels ────────────────────────────────────────── */
     .good-focus {
-        color: #28a745;
-        font-weight: bold;
+        color: #15803d;
+        font-weight: 700;
+        font-size: 1.05rem;
     }
     .poor-focus {
-        color: #dc3545;
-        font-weight: bold;
+        color: #b91c1c;
+        font-weight: 700;
+        font-size: 1.05rem;
+    }
+
+    /* ── Streamlit metric widget ─────────────────────────────── */
+    [data-testid="metric-container"] {
+        background: linear-gradient(135deg, #ffffff, #f0f4ff);
+        border: 1px solid #d0d8ff;
+        border-radius: 14px;
+        padding: 1rem 1.2rem;
+        box-shadow: 0 2px 10px rgba(102,126,234,0.08);
+    }
+    [data-testid="metric-container"] label {
+        font-size: 0.92rem !important;
+        color: #6b7280 !important;
+        font-weight: 600 !important;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    [data-testid="metric-container"] [data-testid="stMetricValue"] {
+        font-size: 2rem !important;
+        font-weight: 800 !important;
+        color: #4338ca !important;
+    }
+
+    /* ── Buttons ─────────────────────────────────────────────── */
+    .stButton > button {
+        font-size: 1rem !important;
+        font-weight: 700 !important;
+        border-radius: 10px !important;
+        padding: 0.55rem 1.4rem !important;
+        transition: all 0.2s ease !important;
+        letter-spacing: 0.2px;
+    }
+    .stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, #667eea, #764ba2) !important;
+        border: none !important;
+        color: white !important;
+        box-shadow: 0 4px 14px rgba(102, 126, 234, 0.45) !important;
+    }
+    .stButton > button[kind="primary"]:hover {
+        transform: translateY(-2px) !important;
+        box-shadow: 0 7px 20px rgba(102, 126, 234, 0.55) !important;
+    }
+    .stButton > button[kind="secondary"] {
+        background: linear-gradient(135deg, #ff6b6b, #ee0979) !important;
+        border: none !important;
+        color: white !important;
+        box-shadow: 0 4px 14px rgba(238, 9, 121, 0.3) !important;
+    }
+    .stButton > button[kind="secondary"]:hover {
+        transform: translateY(-2px) !important;
+        box-shadow: 0 7px 20px rgba(238, 9, 121, 0.45) !important;
+    }
+
+    /* ── Sidebar ─────────────────────────────────────────────── */
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #1a1a4e 0%, #2d2d7e 50%, #3d1a6e 100%) !important;
+    }
+    [data-testid="stSidebar"] * {
+        color: #e8e8ff !important;
+    }
+    [data-testid="stSidebar"] .stRadio label {
+        font-size: 1.05rem !important;
+        font-weight: 600 !important;
+        padding: 0.35rem 0 !important;
+    }
+    [data-testid="stSidebar"] hr {
+        border-color: rgba(255,255,255,0.15) !important;
+    }
+    [data-testid="stSidebar"] h1,
+    [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] h3 {
+        color: #ffffff !important;
+        font-weight: 800 !important;
+    }
+    [data-testid="stSidebar"] [data-testid="metric-container"] {
+        background: rgba(255,255,255,0.1) !important;
+        border-color: rgba(255,255,255,0.2) !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stMetricValue"] {
+        color: #a5f3fc !important;
+    }
+
+    /* ── Alert / info boxes ──────────────────────────────────── */
+    [data-testid="stAlert"] {
+        border-radius: 12px !important;
+        font-size: 1rem !important;
+        font-weight: 500 !important;
+    }
+
+    /* ── Dataframe / table ───────────────────────────────────── */
+    [data-testid="stDataFrame"] {
+        border-radius: 12px !important;
+        overflow: hidden;
+        font-size: 1rem !important;
+    }
+
+    /* ── Text inputs / selects ───────────────────────────────── */
+    .stTextInput input, .stSelectbox select, .stNumberInput input {
+        font-size: 1rem !important;
+        border-radius: 8px !important;
+    }
+
+    /* ── Progress bar ────────────────────────────────────────── */
+    [data-testid="stProgressBar"] > div > div {
+        background: linear-gradient(90deg, #667eea, #f093fb) !important;
+        border-radius: 999px !important;
+    }
+
+    /* ── Expander ────────────────────────────────────────────── */
+    details summary {
+        font-size: 1rem !important;
+        font-weight: 600 !important;
+    }
+
+    /* ── Footer ──────────────────────────────────────────────── */
+    .footer-bar {
+        text-align: center;
+        padding: 0.8rem;
+        font-size: 0.95rem;
+        color: #6b7280;
+        background: linear-gradient(135deg, #f0f4ff, #faf0ff);
+        border-radius: 12px;
+        margin-top: 1rem;
+        border: 1px solid #e0e0ff;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -533,12 +750,13 @@ elif page == "▶️ Start Monitoring":
         if not st.session_state.monitoring_active:
             if st.button("🚀 START MONITORING SESSION", type="primary", use_container_width=True):
                 with st.spinner("🔄 Starting monitoring session..."):
-                    # Clean up any old stop signal file
-                    if os.path.exists('monitor_stop.signal'):
-                        try:
-                            os.remove('monitor_stop.signal')
-                        except:
-                            pass
+                    # Clean up any old signal files
+                    for _sig_file in ('monitor_stop.signal', 'camera_ready.signal'):
+                        if os.path.exists(_sig_file):
+                            try:
+                                os.remove(_sig_file)
+                            except:
+                                pass
                     
                     # Save config file for student_monitor.py
                     config = {
@@ -1158,12 +1376,34 @@ elif page == "📝 Notes":
                     notes_md = star_data.get("notes", "")
                     if notes_md:
                         st.markdown(notes_md)
-                        st.download_button(
-                            label="⬇️ Download Star Notes (.md)",
-                            data=notes_md,
-                            file_name=selected_notes_file.replace(".json", "_star_notes.md"),
-                            mime="text/markdown",
-                        )
+
+                        # ── Action buttons row ────────────────────────────────
+                        btn_dl, btn_listen = st.columns([2, 1])
+                        with btn_dl:
+                            st.download_button(
+                                label="⬇️ Download Star Notes (.md)",
+                                data=notes_md,
+                                file_name=selected_notes_file.replace(".json", "_star_notes.md"),
+                                mime="text/markdown",
+                                use_container_width=True,
+                            )
+                        with btn_listen:
+                            if st.button("🔊 Listen to Notes", use_container_width=True, key="listen_star"):
+                                st.session_state["play_star_audio"] = True
+
+                        # ── Audio player (shown once Listen is clicked) ────────
+                        if st.session_state.get("play_star_audio"):
+                            with st.spinner("Generating audio…"):
+                                plain_text = _markdown_to_plain(notes_md)
+                                audio_bytes = _tts_audio_bytes(plain_text)
+                            if audio_bytes:
+                                st.audio(audio_bytes, format="audio/mp3", autoplay=True)
+                                if st.button("⏹ Stop / Hide Player", key="stop_star_audio"):
+                                    st.session_state["play_star_audio"] = False
+                                    st.rerun()
+                            else:
+                                st.error("⚠️ Could not generate audio. Make sure `gTTS` is installed: `pip install gTTS`")
+                                st.session_state["play_star_audio"] = False
                     else:
                         st.warning("No notes were generated.")
 
@@ -1264,7 +1504,7 @@ elif page == "⚙️ Settings":
 # Footer
 st.markdown("---")
 st.markdown("""
-<div style='text-align: center; color: gray;'>
-    <p>🎓 Sahayak AI | Made with ❤️ using Streamlit</p>
+<div class='footer-bar'>
+    🎓 <strong>Sahayak AI</strong> &nbsp;|&nbsp; Made with ❤️ using Streamlit &nbsp;|&nbsp; v1.0.0
 </div>
 """, unsafe_allow_html=True)

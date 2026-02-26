@@ -34,10 +34,11 @@ except ImportError:
     print("⚠ openai-whisper not available. Install: pip install openai-whisper")
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-SAMPLE_RATE   = 16000   # Whisper expects 16 kHz
-CHUNK_SECONDS = 30      # Each audio chunk length in seconds
-STOP_FILE     = "monitor_stop.signal"
-NOTES_DIR     = "."
+SAMPLE_RATE        = 16000   # Whisper expects 16 kHz
+CHUNK_SECONDS      = 30      # Each audio chunk length in seconds
+STOP_FILE          = "monitor_stop.signal"
+CAMERA_READY_FILE  = "camera_ready.signal"
+NOTES_DIR          = "."
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -118,6 +119,25 @@ def record_and_transcribe(session_id: str):
     print(f"• Chunk size    : {CHUNK_SECONDS}s")
     print(f"• Notes file    : {notes_file}")
     print(f"{'='*60}\n")
+
+    # ── Wait for camera to be ready before starting Whisper ──────────────────
+    print("⏳ Waiting for camera to be ready...")
+    _wait_start = time.time()
+    _camera_wait_timeout = 60  # seconds
+    while not os.path.exists(CAMERA_READY_FILE):
+        if os.path.exists(STOP_FILE):  # session cancelled before camera opened
+            print("⚠ Stop signal received while waiting for camera. Exiting.")
+            return
+        if time.time() - _wait_start > _camera_wait_timeout:
+            print(f"⚠ Camera ready signal not received after {_camera_wait_timeout}s — starting anyway.")
+            break
+        time.sleep(0.5)
+    else:
+        print("✓ Camera is ready — starting audio recording.")
+        try:
+            os.remove(CAMERA_READY_FILE)
+        except Exception:
+            pass
 
     print("⏳ Loading Whisper base model...")
     try:
